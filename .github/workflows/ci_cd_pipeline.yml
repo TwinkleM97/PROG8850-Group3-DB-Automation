@@ -1,0 +1,84 @@
+name: Database CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  db-pipeline:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: Secret5555
+          MYSQL_DATABASE: project_db
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -pSecret5555"
+          --health-interval=5s
+          --health-timeout=2s
+          --health-retries=20
+
+    env:
+      # ACT will inject these from .secrets automatically
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3307
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+      MYSQL_DB: project_db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set MYSQL_PASSWORD fallback for local ACT
+        if: ${{ env.MYSQL_PASSWORD == '' }}
+        run: echo "MYSQL_PASSWORD=Secret5555" >> $GITHUB_ENV
+
+      - name: Install MySQL client & Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+          python -V
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for MySQL healthy
+        run: |
+          for i in {1..60}; do
+            if mysql -h 127.0.0.1 -P 3307 -u root -p"$MYSQL_PASSWORD" -e "SELECT 1" >/dev/null 2>&1; then
+              echo "MySQL is ready"; break
+            fi
+            echo "Waiting for MySQL... ($i)"
+            sleep 2
+          done
+
+      - name: Initial Schema Deployment
+        run: |
+          mysql -h 127.0.0.1 -P 3307 -u root -p"$MYSQL_PASSWORD" < sql/01_create_climatedata.sql
+
+      - name: Schema Update (add humidity)
+        run: |
+          mysql -h 127.0.0.1 -P 3307 -u root -p"$MYSQL_PASSWORD" < sql/02_add_humidity.sql
+
+      - name: Seed Data
+        run: |
+          mysql -h 127.0.0.1 -P 3307 -u root -p"$MYSQL_PASSWORD" < sql/03_seed_data.sql
+
+      - name: Concurrent Queries (Insert/Select/Update)
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: 3307
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ env.MYSQL_PASSWORD }}
+          MYSQL_DB: project_db
+        run: |
+          python scripts/multi_thread_queries.py
+
+      - name: Validation
+        run: |
+          mysql -h 127.0.0.1 -P 3307 -u root -p"$MYSQL_PASSWORD" < sql/99_validate.sql

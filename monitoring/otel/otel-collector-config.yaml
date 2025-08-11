@@ -1,0 +1,29 @@
+receivers:
+  filelog:
+    include:
+      - /var/lib/mysql/mysql-general.log
+      - /var/lib/mysql/mysql-slow.log
+    start_at: beginning
+
+processors:
+  resource:
+    attributes:
+      - key: service.name
+        action: upsert
+        value: automated-mysql-server
+  batch:
+
+exporters:
+  otlp:
+    endpoint: signoz-otel-collector:4317
+    tls:
+      insecure: true
+  logging:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [resource, batch]
+      exporters: [logging, otlp]

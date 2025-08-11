@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  automated-mysql-server:
+    image: mysql:8.0
+    container_name: automated-mysql-server
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: Secret5555
+      MYSQL_DATABASE: project_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/conf.d/my.cnf:ro
+volumes:
+  dbdata:

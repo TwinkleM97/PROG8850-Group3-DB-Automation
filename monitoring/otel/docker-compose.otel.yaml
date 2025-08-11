@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  otelcol-mysql-logs:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    container_name: otelcol-mysql-logs
+    restart: unless-stopped
+    environment:
+      # Change to your SigNoz OTLP gRPC endpoint
+      OTLP_GRPC_ENDPOINT: "host.docker.internal:4317"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      # Share the same volume as MySQL to access logs
+      - mysql_dbdata:/var/lib/mysql:ro
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on: []
+volumes:
+  mysql_dbdata:
+    external: true
+    # use the *same* name created by MySQL compose (monitoring/mysql/docker-compose.mysql.yaml)
+    name: monitoring_mysql_dbdata
