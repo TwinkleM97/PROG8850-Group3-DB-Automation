@@ -7,15 +7,15 @@ AUTO=0
 SKIP_VENV=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --force-config) FORCE_CONFIG=1; shift;;
-    --auto) AUTO=1; shift;;
-    --skip-venv) SKIP_VENV=1; shift;;
-    *) echo "Unknown flag: $1"; exit 1;;
-  case esac
+    --force-config) FORCE_CONFIG=1; shift ;;
+    --auto)         AUTO=1;         shift ;;
+    --skip-venv)    SKIP_VENV=1;    shift ;;
+    *) echo "Unknown flag: $1"; exit 1 ;;
+  esac
 done
 
 # ===== SETTINGS =====
-REPO_NAME="PROG8850-Group3-DB-AutomATION"
+REPO_NAME="PROG8850-Group3-DB-Automation"
 SIG_NOZ_DIR="monitoring/signoz"
 
 # ===== HELPERS =====
@@ -53,7 +53,7 @@ ensure_mysql_logging_runtime() {
   "
 }
 
-ensure_otel_config_file() {
+ensure_otel_mysql_logs_config() {
   mkdir -p monitoring/otel
   if [[ $FORCE_CONFIG -eq 1 || ! -f monitoring/otel/otel-collector-config.yaml ]]; then
     cat > monitoring/otel/otel-collector-config.yaml <<'EOF'
@@ -93,6 +93,38 @@ EOF
   fi
 }
 
+# NEW: docker metrics collector config (docker_stats -> SigNoz)
+ensure_docker_metrics_config() {
+  mkdir -p monitoring/otel
+  if [[ $FORCE_CONFIG -eq 1 || ! -f monitoring/otel/docker-metrics-collector.yaml ]]; then
+    cat > monitoring/otel/docker-metrics-collector.yaml <<'EOF'
+receivers:
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 10s
+
+processors:
+  batch:
+
+exporters:
+  otlp:
+    endpoint: signoz-otel-collector:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [docker_stats]
+      processors: [batch]
+      exporters: [otlp]
+EOF
+    echo "[CFG] Wrote monitoring/otel/docker-metrics-collector.yaml"
+  else
+    echo "[CFG] Using existing monitoring/otel/docker-metrics-collector.yaml (no overwrite)."
+  fi
+}
+
 detect_signoz_network() {
   docker network ls --format '{{.Name}}' | grep -i signoz | head -n1 || true
 }
@@ -101,17 +133,18 @@ start_signoz() {
   echo "=== [S1] Starting SigNoz backend ==="
   if [[ ! -d "$SIG_NOZ_DIR" ]]; then
     mkdir -p monitoring
+    command -v git >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y git; }
     git clone https://github.com/SigNoz/signoz.git "$SIG_NOZ_DIR"
   fi
   pushd "$SIG_NOZ_DIR/deploy/docker" >/dev/null
   docker compose up -d
   popd >/dev/null
-  echo "SigNoz UI: port 3301 (in Codespaces it may appear as 8080)."
+  echo "SigNoz UI: port 3301 (in Codespaces this may appear as 8080)."
 }
 
 start_mysql_log_collector() {
   echo "=== [S2] Starting OTEL collector (MySQL logs -> SigNoz) ==="
-  ensure_otel_config_file
+  ensure_otel_mysql_logs_config
 
   local VOL
   VOL=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' automated-mysql-server || true)
@@ -123,7 +156,6 @@ start_mysql_log_collector() {
   [[ -z "$NET" ]] && { echo "Cannot detect SigNoz docker network. Start SigNoz first."; exit 1; }
   echo "[INFO] Using SigNoz network: $NET"
 
-  # optional: relax perms if needed
   docker exec -it automated-mysql-server sh -lc 'chmod 644 /var/lib/mysql/mysql-*.log || true' >/dev/null 2>&1 || true
 
   docker rm -f otelcol-mysql-logs >/dev/null 2>&1 || true
@@ -136,7 +168,30 @@ start_mysql_log_collector() {
     otel/opentelemetry-collector-contrib:0.108.0 \
     --config=/etc/otelcol/config.yaml
 
-  echo "[OK] Collector started. Tail with: docker logs --tail=80 otelcol-mysql-logs"
+  echo "[OK] MySQL logs collector started. Tail with: docker logs --tail=80 otelcol-mysql-logs"
+}
+
+# NEW: start docker metrics collector (runs as root to access /var/run/docker.sock)
+start_docker_metrics_collector() {
+  echo "=== [S3] Starting OTEL collector (Docker metrics -> SigNoz) ==="
+  ensure_docker_metrics_config
+
+  local NET
+  NET=$(detect_signoz_network)
+  [[ -z "$NET" ]] && { echo "Cannot detect SigNoz docker network. Start SigNoz first."; exit 1; }
+  echo "[INFO] Using SigNoz network: $NET"
+
+  docker rm -f otelcol-docker-metrics >/dev/null 2>&1 || true
+  docker run -d --name otelcol-docker-metrics \
+    --user 0:0 \
+    --network "$NET" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$(pwd)/monitoring/otel/docker-metrics-collector.yaml":/etc/otelcol/config.yaml:ro \
+    --restart unless-stopped \
+    otel/opentelemetry-collector-contrib:0.108.0 \
+    --config=/etc/otelcol/config.yaml
+
+  echo "[OK] Docker metrics collector started. Tail with: docker logs --tail=80 otelcol-docker-metrics"
 }
 
 ask_or_auto() {
@@ -151,7 +206,7 @@ ask_or_auto() {
 
 # ===== MAIN =====
 echo "=== [1] Repo root ==="
-cd /workspaces/PROG8850-Group3-DB-Automation
+cd "/workspaces/$REPO_NAME"
 
 if [[ $SKIP_VENV -eq 1 ]]; then
   echo "=== [2] Skipping venv recreation (flag --skip-venv) ==="
@@ -173,7 +228,10 @@ docker compose -f monitoring/mysql/docker-compose.mysql.yaml up -d
 
 echo "=== [5] Wait for MySQL ==="
 for i in {1..40}; do
-  mysql -h 127.0.0.1 -P 3307 -u root -pSecret5555 -e "SELECT 1" >/dev/null 2>&1 && { echo "MySQL ready."; break; }
+  if mysql -h 127.0.0.1 -P 3307 -u root -pSecret5555 -e "SELECT 1" >/dev/null 2>&1; then
+    echo "MySQL ready."
+    break
+  fi
   echo "…waiting ($i)"; sleep 2
 done
 
@@ -192,9 +250,10 @@ python scripts/multi_thread_queries.py
 echo "=== [9] Validate ==="
 mysql -h 127.0.0.1 -P 3307 -u root -pSecret5555 < sql/99_validate.sql
 
-# Optional steps
+# Optional stack pieces
 ask_or_auto "Start SigNoz backend locally now?" start_signoz
 ask_or_auto "Start OTEL collector to ship MySQL logs to SigNoz?" start_mysql_log_collector
+ask_or_auto "Start OTEL collector to ship Docker metrics to SigNoz?" start_docker_metrics_collector
 
 # act (optional)
 if [[ $AUTO -eq 1 ]]; then
@@ -214,4 +273,5 @@ if [[ "$RUN_ACT" =~ ^[Yy]$ ]]; then
 fi
 
 echo "=== DONE ==="
-echo "Open SigNoz UI (forwarded 3301/8080) → Logs → filter: service.name = automated-mysql-server"
+echo "SigNoz UI → Logs: filter service.name = automated-mysql-server"
+echo "SigNoz UI → Dashboards: use metric 'container_cpu_usage_total' and label 'container_name'."
